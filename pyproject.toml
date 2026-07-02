@@ -1,0 +1,26 @@
+[project]
+name = "spherical-3dgs-prep"
+version = "0.1.0"
+description = "Preprocess 360 equirectangular panoramas into COLMAP registrations for 3DGS experiments."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy",
+    "opencv-python-headless",
+    "pillow",
+    "pycolmap==4.1.0",
+    "rich",
+    "scipy",
+    "tqdm",
+    "typer",
+]
+
+[project.scripts]
+spherical-3dgs-prep = "spherical_3dgs_prep.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.9.7,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+package = true

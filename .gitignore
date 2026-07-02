@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+venv/
+.env
+.env.*
+
+# Local run artifacts and generated COLMAP outputs
+runs/
+*.db
+*.db-shm
+*.db-wal
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+
