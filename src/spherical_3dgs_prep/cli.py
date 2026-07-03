@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 from collections.abc import Sequence
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +61,12 @@ class PanoRenderOptions:
     vfov_deg: float
 
 
+@dataclass(frozen=True)
+class ModelWriteResult:
+    equirectangular_exported: bool
+    equirectangular_export_skip_reason: str | None = None
+
+
 PANO_RENDER_OPTIONS: dict[PanoRenderType, PanoRenderOptions] = {
     PanoRenderType.PERSPECTIVE_OVERLAPPING: PanoRenderOptions(
         num_steps_yaw=4,
@@ -112,7 +119,7 @@ def create_virtual_camera(
     image_width = int(pano_width * hfov_deg / 360)
     image_height = int(pano_height * vfov_deg / 180)
     focal = image_width / (2 * np.tan(np.deg2rad(hfov_deg) / 2))
-    camera = pycolmap.Camera.create_from_model_id(
+    camera = create_colmap_camera(
         camera_id=0,
         model=pycolmap.CameraModelId.SIMPLE_PINHOLE,
         focal_length=focal,
@@ -121,6 +128,78 @@ def create_virtual_camera(
     )
     camera.has_prior_focal_length = True
     return camera
+
+
+def camera_model_id_name(model: object) -> str:
+    if isinstance(model, str):
+        return model
+    name = getattr(model, "name", None)
+    if isinstance(name, str):
+        return name
+    return str(model).rsplit(".", 1)[-1]
+
+
+def camera_model_name(camera: pycolmap.Camera) -> str:
+    model_name = getattr(camera, "model_name", None)
+    if isinstance(model_name, str):
+        return model_name
+    return camera_model_id_name(camera.model)
+
+
+def camera_params_string(camera: pycolmap.Camera) -> str:
+    params = np.asarray(camera.params, dtype=np.float64)
+    return ",".join(f"{value:.17g}" for value in params)
+
+
+def create_colmap_camera(
+    *,
+    camera_id: int,
+    model: object,
+    focal_length: float,
+    width: int,
+    height: int,
+) -> pycolmap.Camera:
+    create_from_model_id = getattr(pycolmap.Camera, "create_from_model_id", None)
+    if callable(create_from_model_id):
+        return create_from_model_id(
+            camera_id=camera_id,
+            model=model,
+            focal_length=focal_length,
+            width=width,
+            height=height,
+        )
+
+    create = getattr(pycolmap.Camera, "create", None)
+    if callable(create):
+        return create(
+            camera_id=camera_id,
+            model=camera_model_id_name(model),
+            focal_length=focal_length,
+            width=width,
+            height=height,
+        )
+
+    return pycolmap.Camera(
+        camera_id=camera_id,
+        model=model,
+        width=width,
+        height=height,
+        params=[focal_length, width / 2, height / 2],
+    )
+
+
+def camera_rays_from_img(
+    camera: pycolmap.Camera,
+    image_points: npt.NDArray[np.floating],
+) -> npt.NDArray[np.floating]:
+    cam_ray_from_img = getattr(camera, "cam_ray_from_img", None)
+    if callable(cam_ray_from_img):
+        return np.asarray(cam_ray_from_img(image_points=image_points))
+
+    xy_norm: npt.NDArray[np.floating] = np.asarray(
+        camera.cam_from_img(image_points=image_points)
+    )
+    return np.concatenate([xy_norm, np.ones_like(xy_norm[:, :1])], -1)
 
 
 def get_virtual_camera_rays(camera: pycolmap.Camera) -> npt.NDArray[np.floating]:
@@ -312,7 +391,7 @@ class PanoProcessor:
 
             mask_path = self.mask_dir / mask_name
             mask_path.parent.mkdir(exist_ok=True, parents=True)
-            if not pycolmap.Bitmap.from_array(mask).write(mask_path):
+            if not pycolmap.Bitmap.from_array(mask).write(str(mask_path)):
                 raise RuntimeError(f"Cannot write {mask_path}")
 
             self._maybe_write_preview(image_name, image, mask)
@@ -349,7 +428,7 @@ class PanoProcessor:
 
         pano_width, pano_height = self._pano_size
         equirect = pycolmap.Reconstruction()
-        equirect_camera = pycolmap.Camera.create_from_model_id(
+        equirect_camera = create_colmap_camera(
             camera_id=1,
             model=pycolmap.CameraModelId.EQUIRECTANGULAR,
             focal_length=0.0,
@@ -395,9 +474,7 @@ class PanoProcessor:
                     continue
 
                 xy = np.array([point2D.xy for point2D in image.points2D])
-                rays_in_cam: npt.NDArray[np.floating] = np.asarray(
-                    self._camera.cam_ray_from_img(image_points=xy)
-                )
+                rays_in_cam = camera_rays_from_img(self._camera, xy)
                 rays_in_cam /= np.linalg.norm(rays_in_cam, axis=-1, keepdims=True)
                 rays_in_pano = rays_in_cam @ self.cams_from_pano_rotation[cam_idx]
                 xy_in_pano = spherical_img_from_cam(self._pano_size, rays_in_pano)
@@ -617,23 +694,110 @@ def render_perspective_images(
     return processor
 
 
+def create_sift_extraction_options() -> object | None:
+    options_cls = getattr(pycolmap, "SiftExtractionOptions", None)
+    if options_cls is None:
+        options_cls = getattr(pycolmap, "FeatureExtractionOptions", None)
+    if options_cls is None:
+        return None
+
+    options = options_cls()
+    if hasattr(options, "use_gpu"):
+        options.use_gpu = bool(getattr(pycolmap, "has_cuda", False))
+    return options
+
+
+def create_sift_matching_options() -> object:
+    options_cls = getattr(pycolmap, "SiftMatchingOptions", None)
+    if options_cls is None:
+        options_cls = getattr(pycolmap, "FeatureMatchingOptions")
+
+    options = options_cls()
+    if hasattr(options, "use_gpu"):
+        options.use_gpu = bool(getattr(pycolmap, "has_cuda", False))
+    if hasattr(options, "rig_verification"):
+        options.rig_verification = True
+    if hasattr(options, "skip_image_pairs_in_same_frame"):
+        options.skip_image_pairs_in_same_frame = True
+    return options
+
+
+@contextmanager
+def open_colmap_database(path: Path):
+    try:
+        database_context = pycolmap.Database.open(str(path))
+    except TypeError:
+        database = pycolmap.Database()
+        database.open(str(path))
+        try:
+            yield database
+        finally:
+            database.close()
+    else:
+        with database_context as database:
+            yield database
+
+
 def run_matcher(
     matcher: Matcher,
     database_path: Path,
-    matching_options: pycolmap.FeatureMatchingOptions,
 ) -> None:
+    if hasattr(pycolmap, "FeatureMatchingOptions"):
+        matching_options = create_sift_matching_options()
+        if matcher == Matcher.SEQUENTIAL:
+            pycolmap.match_sequential(
+                str(database_path),
+                pairing_options=pycolmap.SequentialPairingOptions(
+                    loop_detection=True
+                ),
+                matching_options=matching_options,
+            )
+        elif matcher == Matcher.EXHAUSTIVE:
+            pycolmap.match_exhaustive(
+                str(database_path), matching_options=matching_options
+            )
+        elif matcher == Matcher.VOCABTREE:
+            pycolmap.match_vocabtree(
+                str(database_path), matching_options=matching_options
+            )
+        elif matcher == Matcher.SPATIAL:
+            pycolmap.match_spatial(str(database_path), matching_options=matching_options)
+        else:
+            raise ValueError(f"Unknown matcher: {matcher}")
+        return
+
+    sift_options = create_sift_matching_options()
+    verification_options = pycolmap.TwoViewGeometryOptions()
     if matcher == Matcher.SEQUENTIAL:
+        sequential_options = pycolmap.SequentialMatchingOptions()
+        sequential_options.loop_detection = True
         pycolmap.match_sequential(
-            database_path,
-            pairing_options=pycolmap.SequentialPairingOptions(loop_detection=True),
-            matching_options=matching_options,
+            str(database_path),
+            sift_options=sift_options,
+            matching_options=sequential_options,
+            verification_options=verification_options,
         )
     elif matcher == Matcher.EXHAUSTIVE:
-        pycolmap.match_exhaustive(database_path, matching_options=matching_options)
+        pycolmap.match_exhaustive(
+            str(database_path),
+            sift_options=sift_options,
+            matching_options=pycolmap.ExhaustiveMatchingOptions(),
+            verification_options=verification_options,
+        )
     elif matcher == Matcher.VOCABTREE:
-        pycolmap.match_vocabtree(database_path, matching_options=matching_options)
+        pycolmap.match_vocabtree(
+            str(database_path),
+            sift_options=sift_options,
+            matching_options=pycolmap.VocabTreeMatchingOptions(),
+            verification_options=verification_options,
+        )
     elif matcher == Matcher.SPATIAL:
-        pycolmap.match_spatial(database_path, matching_options=matching_options)
+        pycolmap.match_spatial(
+            str(database_path),
+            sift_options=sift_options,
+            matching_options=pycolmap.SpatialMatchingOptions(),
+            verification_options=verification_options,
+        )
     else:
         raise ValueError(f"Unknown matcher: {matcher}")
 
@@ -670,17 +834,26 @@ def write_best_models(
     processor: PanoProcessor,
     sparse_path: Path,
     sparse_equirect_path: Path,
-) -> None:
+) -> ModelWriteResult:
     best_sparse_path = sparse_path / "0"
     shutil.rmtree(best_sparse_path, ignore_errors=True)
     best_sparse_path.mkdir(parents=True, exist_ok=True)
-    best_rec.write(best_sparse_path)
+    best_rec.write(str(best_sparse_path))
+
+    if not hasattr(pycolmap.CameraModelId, "EQUIRECTANGULAR"):
+        return ModelWriteResult(
+            equirectangular_exported=False,
+            equirectangular_export_skip_reason=(
+                "PyCOLMAP does not expose CameraModelId.EQUIRECTANGULAR."
+            ),
+        )
 
     equirect_rec = processor.convert_to_equirectangular(best_rec)
     best_equirect_path = sparse_equirect_path / "0"
     shutil.rmtree(best_equirect_path, ignore_errors=True)
     best_equirect_path.mkdir(parents=True, exist_ok=True)
-    equirect_rec.write(best_equirect_path)
+    equirect_rec.write(str(best_equirect_path))
+    return ModelWriteResult(equirectangular_exported=True)
 
 
 def summarize_registration(
@@ -694,6 +867,7 @@ def summarize_registration(
     best_rec: pycolmap.Reconstruction | None,
     expected_rendered_images: int,
     min_registered_pano_ratio: float,
+    model_write_result: ModelWriteResult,
 ) -> dict[str, object]:
     rendered_image_count = sum(1 for _ in (output_path / "images").rglob("*.jpg"))
     mask_count = sum(1 for _ in (output_path / "masks").rglob("*.png"))
@@ -761,6 +935,10 @@ def summarize_registration(
         "mean_reprojection_error": mean_reprojection_error,
         "min_registered_pano_ratio": min_registered_pano_ratio,
         "passed_registration_threshold": passed,
+        "equirectangular_exported": model_write_result.equirectangular_exported,
+        "equirectangular_export_skip_reason": (
+            model_write_result.equirectangular_export_skip_reason
+        ),
         "output_size_bytes": directory_size(output_path),
     }
 
@@ -891,50 +1069,80 @@ def register(
     assert rendered_camera is not None
 
     console.print("Extracting features with pycolmap.")
+    extraction_kwargs: dict[str, object] = {}
+    sift_extraction_options = create_sift_extraction_options()
+    if sift_extraction_options is not None:
+        if hasattr(pycolmap, "SiftExtractionOptions"):
+            extraction_kwargs["sift_options"] = sift_extraction_options
+            extraction_kwargs["camera_model"] = camera_model_name(rendered_camera)
+        else:
+            extraction_kwargs["extraction_options"] = sift_extraction_options
+
     pycolmap.extract_features(
-        database_path,
-        image_dir,
+        str(database_path),
+        str(image_dir),
         reader_options=pycolmap.ImageReaderOptions(
-            mask_path=masks_dir,
-            camera_model=rendered_camera.model_name,
-            camera_params=rendered_camera.params_to_string(),
+            mask_path=str(masks_dir),
+            camera_model=camera_model_name(rendered_camera),
+            camera_params=camera_params_string(rendered_camera),
         ),
         camera_mode=pycolmap.CameraMode.PER_FOLDER,
+        **extraction_kwargs,
     )
 
-    with pycolmap.Database.open(database_path) as db:
+    with open_colmap_database(database_path) as db:
         pycolmap.apply_rig_config([processor.rig_config], db)
 
-    matching_options = pycolmap.FeatureMatchingOptions()
-    matching_options.rig_verification = True
-    matching_options.skip_image_pairs_in_same_frame = True
     console.print(f"Matching features with {matcher.value}.")
-    run_matcher(matcher, database_path, matching_options)
+    run_matcher(matcher, database_path)
 
     console.print(f"Running {mapper.value} mapping.")
     if mapper == Mapper.INCREMENTAL:
-        opts = pycolmap.IncrementalPipelineOptions(
-            ba_refine_sensor_from_rig=False,
-            ba_refine_focal_length=False,
-            ba_refine_principal_point=False,
-            ba_refine_extra_params=False,
+        opts = pycolmap.IncrementalPipelineOptions()
+        opts.ba_refine_sensor_from_rig = False
+        opts.ba_refine_focal_length = False
+        opts.ba_refine_principal_point = False
+        opts.ba_refine_extra_params = False
+        if hasattr(opts, "ba_use_gpu"):
+            # The conda-forge Jetson CUDA build accelerates SIFT, but its Ceres
+            # build does not currently support CUDA bundle adjustment reliably.
+            opts.ba_use_gpu = False
+        recs = pycolmap.incremental_mapping(
+            str(database_path), str(image_dir), str(sparse_path), opts
         )
-        recs = pycolmap.incremental_mapping(database_path, image_dir, sparse_path, opts)
     elif mapper == Mapper.GLOBAL:
+        if not hasattr(pycolmap, "global_mapping"):
+            raise typer.BadParameter(
+                "The selected PyCOLMAP build does not expose global_mapping. "
+                "Use --mapper incremental."
+            )
         global_opts = pycolmap.GlobalPipelineOptions(
             mapper=pycolmap.GlobalMapperOptions(refine_sensor_from_rig=False)
         )
         global_opts.mapper.bundle_adjustment.refine_focal_length = False
         global_opts.mapper.bundle_adjustment.refine_principal_point = False
         global_opts.mapper.bundle_adjustment.refine_extra_params = False
-        recs = pycolmap.global_mapping(database_path, image_dir, sparse_path, global_opts)
+        recs = pycolmap.global_mapping(
+            str(database_path), str(image_dir), str(sparse_path), global_opts
+        )
     else:
         raise ValueError(f"Unknown mapper: {mapper}")
 
     best_model_id, best_rec = choose_best_reconstruction(recs)
+    model_write_result = ModelWriteResult(
+        equirectangular_exported=False,
+        equirectangular_export_skip_reason="No reconstruction was produced.",
+    )
     if best_rec is not None:
         console.print(f"Writing best model {best_model_id} to sparse/0.")
-        write_best_models(best_rec, processor, sparse_path, sparse_equirect_path)
+        model_write_result = write_best_models(
+            best_rec, processor, sparse_path, sparse_equirect_path
+        )
+        if model_write_result.equirectangular_export_skip_reason:
+            console.print(
+                "Skipped sparse_equirectangular export: "
+                f"{model_write_result.equirectangular_export_skip_reason}"
+            )
 
     summary = summarize_registration(
         output_path=output_path,
@@ -946,6 +1154,7 @@ def register(
         best_rec=best_rec,
         expected_rendered_images=expected_rendered_images,
         min_registered_pano_ratio=threshold,
+        model_write_result=model_write_result,
     )
     summary_path = reports_dir / "registration_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")

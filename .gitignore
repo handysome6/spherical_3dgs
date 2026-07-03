@@ -11,6 +11,7 @@ htmlcov/
 
 # Environments
 .venv/
+.pixi/
 venv/
 .env
 .env.*
@@ -21,8 +22,19 @@ runs/
 *.db-shm
 *.db-wal
 
+# Build artifacts
+build/
+dist/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Local COLMAP/glog output
+colmap.INFO
+*.log.INFO.*
+
 # OS/editor noise
 .DS_Store
 .idea/
 .vscode/
-

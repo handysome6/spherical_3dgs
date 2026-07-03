@@ -1,0 +1,23 @@
+[workspace]
+authors = ["AndyLiu <handysome6@gmail.com>"]
+channels = ["conda-forge"]
+name = "spherical-3dgs-prep"
+platforms = [{ platform = "linux-aarch64", cuda = "12.6" }]
+version = "0.1.0"
+
+[dependencies]
+python = "3.12.*"
+cuda-version = "12.6.*"
+numpy = "*"
+opencv = "*"
+pillow = "*"
+pycolmap = { version = "==3.12.1", build = "cuda126py312h44145ad_0" }
+rich = "*"
+scipy = "*"
+tqdm = "*"
+typer = "*"
+
+[tasks]
+prep = "PYTHONPATH=src python -m spherical_3dgs_prep.cli"
+prep-tiny = "PYTHONPATH=src python -m spherical_3dgs_prep.cli register --input /home/jetson/sphere_images --output runs/jetson_debug_tiny --start 1 --end 4 --stride 1 --min-registered-pano-ratio 0"
+prep-smoke = "PYTHONPATH=src python -m spherical_3dgs_prep.cli register --input /home/jetson/sphere_images --output runs/jetson_sphere_images_smoke --start 1 --end 80 --stride 2"
