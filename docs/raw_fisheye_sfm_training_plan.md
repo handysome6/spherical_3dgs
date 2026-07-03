@@ -54,6 +54,70 @@ This matters because dual-fisheye input is naturally a rig with two fisheye sens
 
 ## Proposed Experiment Stages
 
+## Current Repo Support
+
+The repo now includes an experimental raw-fisheye SfM command:
+
+Status: implemented but untested on real raw fisheye data. The current checks
+cover CLI/help validation, command generation, masks, and dry-run staging only.
+
+```bash
+pixi run prep register-fisheye \
+  --input /path/to/raw_fisheye_images \
+  --output runs/raw_fisheye_A \
+  --camera-model OPENCV_FISHEYE
+```
+
+Important behavior:
+
+- selected raw images are staged under `runs/<name>/images`;
+- `image_list.txt` preserves the selected frame order;
+- optional raw-coordinate masks are written under `runs/<name>/masks`;
+- COLMAP commands are recorded in `runs/<name>/colmap_commands.json`;
+- command logs are written under `runs/<name>/logs`;
+- reconstruction metrics are written to
+  `runs/<name>/reports/registration_summary.json`.
+
+Useful first-test options:
+
+```bash
+pixi run prep register-fisheye \
+  --input /path/to/raw_fisheye_images \
+  --output runs/raw_fisheye_A \
+  --start 1 \
+  --end 100 \
+  --camera-model OPENCV_FISHEYE \
+  --lens-circle 0.5,0.5,0.48 \
+  --mask-rect 0.0,0.85,1.0,1.0 \
+  --dry-run
+```
+
+For calibrated intrinsics:
+
+```bash
+pixi run prep register-fisheye \
+  --input /path/to/raw_fisheye_images \
+  --output runs/raw_fisheye_fixed \
+  --camera-model OPENCV_FISHEYE \
+  --camera-params fx,fy,cx,cy,k1,k2,k3,k4 \
+  --fix-intrinsics
+```
+
+For dual-fisheye folders:
+
+```bash
+pixi run prep register-fisheye \
+  --input /path/to/raw_dual_fisheye \
+  --output runs/raw_dual_fisheye_A \
+  --layout dual \
+  --sensor-folder fisheye_left \
+  --sensor-folder fisheye_right
+```
+
+The current dual-fisheye implementation shares intrinsics per sensor folder but
+does not yet fix the physical rig extrinsics between the two lenses. Add fixed
+rig configuration after the raw frame format and calibration are known.
+
 ### Stage 0: Data and Metadata Audit
 
 Collect:
@@ -226,4 +290,3 @@ A raw fisheye run is promising if:
 6. Inspect intrinsics, trajectory, sparse points, and registered ratio.
 7. Pick the best model and rerun on a larger subset.
 8. Decide whether downstream training will be direct fisheye-aware or converted to pinhole/perspective views.
-

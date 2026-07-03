@@ -11,6 +11,49 @@ This project currently implements the conservative first path:
 
 No 3DGS training is run by this tool.
 
+## Raw Fisheye SfM
+
+The experimental raw-fisheye path runs COLMAP directly on fisheye frames:
+
+Status: implemented but untested on real raw fisheye data. So far it has only
+been validated with command/help checks and dry-run plumbing tests.
+
+```bash
+pixi run prep register-fisheye \
+  --input /path/to/raw_fisheye_images \
+  --output runs/raw_fisheye_A \
+  --camera-model OPENCV_FISHEYE \
+  --lens-circle 0.5,0.5,0.48 \
+  --mask-rect 0.0,0.85,1.0,1.0
+```
+
+For calibrated intrinsics, pass COLMAP camera parameters and fix them during BA:
+
+```bash
+pixi run prep register-fisheye \
+  --input /path/to/raw_fisheye_images \
+  --output runs/raw_fisheye_fixed \
+  --camera-model OPENCV_FISHEYE \
+  --camera-params fx,fy,cx,cy,k1,k2,k3,k4 \
+  --fix-intrinsics
+```
+
+For dual-fisheye folders:
+
+```bash
+pixi run prep register-fisheye \
+  --input /path/to/raw_dual_fisheye \
+  --output runs/raw_dual_fisheye_A \
+  --layout dual \
+  --sensor-folder fisheye_left \
+  --sensor-folder fisheye_right
+```
+
+The command writes staged images, optional raw-coordinate masks, COLMAP logs,
+`colmap_commands.json`, `database.db`, `sparse/`, and
+`reports/registration_summary.json`. Use `--dry-run` to prepare and inspect the
+run directory without launching COLMAP.
+
 ## Smoke Run
 
 ```bash

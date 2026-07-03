@@ -4,7 +4,9 @@ import collections
 import enum
 import json
 import os
+import shlex
 import shutil
+import subprocess
 from collections.abc import Sequence
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -53,6 +55,20 @@ class PanoRenderType(enum.StrEnum):
     PERSPECTIVE_NON_OVERLAPPING = enum.auto()
 
 
+class FisheyeLayout(enum.StrEnum):
+    SINGLE = enum.auto()
+    DUAL = enum.auto()
+
+
+class FisheyeCameraModel(enum.StrEnum):
+    OPENCV_FISHEYE = "OPENCV_FISHEYE"
+    RADIAL_FISHEYE = "RADIAL_FISHEYE"
+    SIMPLE_RADIAL_FISHEYE = "SIMPLE_RADIAL_FISHEYE"
+    FOV = "FOV"
+    THIN_PRISM_FISHEYE = "THIN_PRISM_FISHEYE"
+    RAD_TAN_THIN_PRISM_FISHEYE = "RAD_TAN_THIN_PRISM_FISHEYE"
+
+
 @dataclass(frozen=True)
 class PanoRenderOptions:
     num_steps_yaw: int
@@ -65,6 +81,13 @@ class PanoRenderOptions:
 class ModelWriteResult:
     equirectangular_exported: bool
     equirectangular_export_skip_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class FisheyeImageSelection:
+    image_names: list[str]
+    image_counts_by_sensor: dict[str, int]
+    image_sizes_by_sensor: dict[str, tuple[int, int]]
 
 
 PANO_RENDER_OPTIONS: dict[PanoRenderType, PanoRenderOptions] = {
@@ -95,6 +118,7 @@ DEFAULT_SELF_MASK_RECTS: tuple[tuple[float, float, float, float], ...] = (
 
 MANAGED_OUTPUT_DIRS = (
     "images",
+    "logs",
     "masks",
     "previews",
     "reports",
@@ -102,9 +126,12 @@ MANAGED_OUTPUT_DIRS = (
     "sparse_equirectangular",
 )
 MANAGED_OUTPUT_FILES = (
+    "colmap_commands.json",
     "database.db",
     "database.db-shm",
     "database.db-wal",
+    "fisheye_config.json",
+    "image_list.txt",
     "self_mask.png",
 )
 
@@ -561,6 +588,135 @@ def collect_pano_names(
     return [p.relative_to(input_path).as_posix() for p in selected]
 
 
+def collect_fisheye_images(
+    input_path: Path,
+    layout: FisheyeLayout,
+    sensor_folders: Sequence[str],
+    start: int | None,
+    end: int | None,
+    stride: int,
+) -> FisheyeImageSelection:
+    if stride < 1:
+        raise typer.BadParameter("--stride must be >= 1.")
+
+    suffixes = {".jpg", ".jpeg", ".png"}
+    if layout == FisheyeLayout.SINGLE:
+        sensors = [(".", input_path)]
+    elif layout == FisheyeLayout.DUAL:
+        if not sensor_folders:
+            sensor_folders = ("fisheye_left", "fisheye_right")
+        if len(sensor_folders) < 2:
+            raise typer.BadParameter(
+                "Dual fisheye layout requires at least two --sensor-folder values."
+            )
+        sensors = []
+        for folder in sensor_folders:
+            folder_path = Path(folder)
+            if folder_path.is_absolute() or ".." in folder_path.parts:
+                raise typer.BadParameter(
+                    f"Sensor folder {folder!r} must be a relative path."
+                )
+            sensors.append((folder_path.as_posix(), input_path / folder_path))
+    else:
+        raise ValueError(f"Unknown fisheye layout: {layout}")
+
+    image_names_by_sensor: dict[str, list[str]] = {}
+    image_counts_by_sensor: dict[str, int] = {}
+    image_sizes_by_sensor: dict[str, tuple[int, int]] = {}
+
+    for sensor_name, sensor_root in sensors:
+        if not sensor_root.is_dir():
+            raise typer.BadParameter(f"Sensor image directory does not exist: {sensor_root}")
+
+        paths = sorted(
+            [
+                p
+                for p in sensor_root.rglob("*")
+                if p.is_file() and p.suffix.lower() in suffixes
+            ],
+            key=natural_image_key,
+        )
+        selected: list[Path] = []
+        for path in paths:
+            idx = numeric_stem(path)
+            if start is not None or end is not None:
+                if idx is None:
+                    continue
+                if start is not None and idx < start:
+                    continue
+                if end is not None and idx > end:
+                    continue
+            selected.append(path)
+
+        selected = selected[::stride]
+        if not selected:
+            raise typer.BadParameter(
+                f"No images matched the requested range for sensor {sensor_name}."
+            )
+
+        expected_size: tuple[int, int] | None = None
+        image_names: list[str] = []
+        for path in selected:
+            with PIL.Image.open(path) as image:
+                size = image.size
+            if expected_size is None:
+                expected_size = size
+            elif size != expected_size:
+                raise ValueError(
+                    f"{path} is {size[0]}x{size[1]}, "
+                    f"expected {expected_size[0]}x{expected_size[1]} for "
+                    f"sensor {sensor_name}."
+                )
+            image_names.append(path.relative_to(input_path).as_posix())
+
+        assert expected_size is not None
+        image_names_by_sensor[sensor_name] = image_names
+        image_counts_by_sensor[sensor_name] = len(image_names)
+        image_sizes_by_sensor[sensor_name] = expected_size
+
+    if layout == FisheyeLayout.SINGLE:
+        ordered_image_names = next(iter(image_names_by_sensor.values()))
+    else:
+        ordered_image_names = []
+        max_sensor_count = max(len(names) for names in image_names_by_sensor.values())
+        for idx in range(max_sensor_count):
+            for sensor_name, _ in sensors:
+                sensor_names = image_names_by_sensor[sensor_name]
+                if idx < len(sensor_names):
+                    ordered_image_names.append(sensor_names[idx])
+
+    return FisheyeImageSelection(
+        image_names=ordered_image_names,
+        image_counts_by_sensor=image_counts_by_sensor,
+        image_sizes_by_sensor=image_sizes_by_sensor,
+    )
+
+
+def stage_fisheye_images(
+    input_path: Path,
+    output_image_dir: Path,
+    image_names: Sequence[str],
+    copy_images: bool,
+) -> None:
+    for image_name in image_names:
+        src = input_path / image_name
+        dst = output_image_dir / image_name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        if copy_images:
+            shutil.copy2(src, dst)
+        else:
+            os.symlink(src, dst)
+
+
+def write_image_list(image_list_path: Path, image_names: Sequence[str]) -> None:
+    image_list_path.write_text(
+        "".join(f"{image_name}\n" for image_name in image_names),
+        encoding="utf-8",
+    )
+
+
 def validate_panoramas(input_path: Path, pano_names: Sequence[str]) -> tuple[int, int]:
     expected_size: tuple[int, int] | None = None
     for pano_name in pano_names:
@@ -599,6 +755,24 @@ def parse_mask_rect(rect: str) -> tuple[float, float, float, float]:
     return (x0, y0, x1, y1)
 
 
+def parse_lens_circle(circle: str) -> tuple[float, float, float]:
+    parts = [part.strip() for part in circle.split(",")]
+    if len(parts) != 3:
+        raise typer.BadParameter(
+            f"Lens circle {circle!r} must use cx,cy,r normalized coordinates."
+        )
+    try:
+        cx, cy, radius = [float(part) for part in parts]
+    except ValueError as exc:
+        raise typer.BadParameter(f"Lens circle {circle!r} contains a non-number.") from exc
+    if not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0 and 0.0 < radius <= 1.0):
+        raise typer.BadParameter(
+            f"Lens circle {circle!r} must satisfy 0 <= cx,cy <= 1 "
+            "and 0 < r <= 1."
+        )
+    return (cx, cy, radius)
+
+
 def build_self_mask(
     pano_size: tuple[int, int],
     use_default_mask: bool,
@@ -620,6 +794,72 @@ def build_self_mask(
         bottom = int(round(y1 * height))
         mask[top:bottom, left:right] = 0
     return mask
+
+
+def build_fisheye_mask(
+    image_size: tuple[int, int],
+    mask_rects: Sequence[tuple[float, float, float, float]],
+    lens_circle: tuple[float, float, float] | None,
+) -> npt.NDArray[np.uint8] | None:
+    if not mask_rects and lens_circle is None:
+        return None
+
+    width, height = image_size
+    mask = np.full((height, width), 255, dtype=np.uint8)
+    if lens_circle is not None:
+        cx, cy, radius = lens_circle
+        center_x = cx * width
+        center_y = cy * height
+        pixel_radius = radius * min(width, height)
+        yy, xx = np.ogrid[:height, :width]
+        outside_lens = (xx - center_x) ** 2 + (yy - center_y) ** 2 > pixel_radius**2
+        mask[outside_lens] = 0
+
+    for x0, y0, x1, y1 in mask_rects:
+        left = int(round(x0 * width))
+        top = int(round(y0 * height))
+        right = int(round(x1 * width))
+        bottom = int(round(y1 * height))
+        mask[top:bottom, left:right] = 0
+    return mask
+
+
+def write_fisheye_masks(
+    image_dir: Path,
+    mask_dir: Path,
+    preview_dir: Path,
+    image_names: Sequence[str],
+    mask_rects: Sequence[tuple[float, float, float, float]],
+    lens_circle: tuple[float, float, float] | None,
+    preview_count: int,
+) -> int:
+    if not mask_rects and lens_circle is None:
+        return 0
+
+    mask_count = 0
+    for image_name in image_names:
+        image_path = image_dir / image_name
+        with PIL.Image.open(image_path) as pil_image:
+            image = np.asarray(pil_image.convert("RGB"))
+            image_size = pil_image.size
+
+        mask = build_fisheye_mask(image_size, mask_rects, lens_circle)
+        assert mask is not None
+        mask_path = mask_dir / f"{image_name}.png"
+        mask_path.parent.mkdir(parents=True, exist_ok=True)
+        if not pycolmap.Bitmap.from_array(mask).write(str(mask_path)):
+            raise RuntimeError(f"Cannot write {mask_path}")
+
+        if mask_count < preview_count:
+            preview_name = image_name.replace("/", "_")
+            PIL.Image.fromarray(image).save(preview_dir / preview_name)
+            PIL.Image.fromarray(mask).save(preview_dir / f"{preview_name}.mask.png")
+            PIL.Image.fromarray(overlay_mask(image, mask)).save(
+                preview_dir / f"{preview_name}.mask.jpg",
+                quality=95,
+            )
+        mask_count += 1
+    return mask_count
 
 
 def overlay_mask(
@@ -954,6 +1194,221 @@ def directory_size(path: Path) -> int:
     return total
 
 
+def bool_arg(value: bool) -> str:
+    return "1" if value else "0"
+
+
+def command_string(command: Sequence[str]) -> str:
+    return shlex.join(command)
+
+
+def run_logged_command(label: str, command: Sequence[str], log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(f"$ {command_string(command)}\n\n", encoding="utf-8")
+    console.print(f"Running {label}. Log: {log_path}")
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(
+            f"COLMAP binary {command[0]!r} was not found."
+        ) from exc
+
+    with log_path.open("a", encoding="utf-8") as log_file:
+        assert process.stdout is not None
+        for line in process.stdout:
+            log_file.write(line)
+
+    return_code = process.wait()
+    if return_code != 0:
+        raise RuntimeError(
+            f"{label} failed with exit code {return_code}. See {log_path}."
+        )
+
+
+def build_fisheye_colmap_commands(
+    *,
+    colmap_binary: str,
+    database_path: Path,
+    image_dir: Path,
+    masks_dir: Path,
+    sparse_path: Path,
+    image_list_path: Path,
+    layout: FisheyeLayout,
+    camera_model: FisheyeCameraModel,
+    camera_params: str | None,
+    mask_count: int,
+    matcher: Matcher,
+    loop_detection: bool,
+    vocab_tree_path: Path | None,
+    use_gpu: bool,
+    gpu_index: str,
+    fix_intrinsics: bool,
+    refine_principal_point: bool,
+) -> dict[str, list[str]]:
+    feature_command = [
+        colmap_binary,
+        "feature_extractor",
+        "--database_path",
+        str(database_path),
+        "--image_path",
+        str(image_dir),
+        "--image_list_path",
+        str(image_list_path),
+        "--ImageReader.camera_model",
+        camera_model.value,
+        "--FeatureExtraction.use_gpu",
+        bool_arg(use_gpu),
+        "--FeatureExtraction.gpu_index",
+        gpu_index,
+    ]
+    if camera_params:
+        feature_command.extend(["--ImageReader.camera_params", camera_params])
+    if mask_count:
+        feature_command.extend(["--ImageReader.mask_path", str(masks_dir)])
+    if layout == FisheyeLayout.SINGLE:
+        feature_command.extend(["--ImageReader.single_camera", "1"])
+    else:
+        feature_command.extend(["--ImageReader.single_camera_per_folder", "1"])
+
+    matcher_command_name = {
+        Matcher.SEQUENTIAL: "sequential_matcher",
+        Matcher.EXHAUSTIVE: "exhaustive_matcher",
+        Matcher.VOCABTREE: "vocab_tree_matcher",
+        Matcher.SPATIAL: "spatial_matcher",
+    }[matcher]
+    matcher_command = [
+        colmap_binary,
+        matcher_command_name,
+        "--database_path",
+        str(database_path),
+        "--FeatureMatching.use_gpu",
+        bool_arg(use_gpu),
+        "--FeatureMatching.gpu_index",
+        gpu_index,
+    ]
+    if matcher == Matcher.SEQUENTIAL:
+        matcher_command.extend(
+            ["--SequentialMatching.loop_detection", bool_arg(loop_detection)]
+        )
+    elif matcher == Matcher.VOCABTREE:
+        if vocab_tree_path is None:
+            raise typer.BadParameter(
+                "--vocab-tree-path is required when --matcher vocabtree is used."
+            )
+        matcher_command.extend(
+            ["--VocabTreeMatching.vocab_tree_path", str(vocab_tree_path)]
+        )
+
+    refine_intrinsics = not fix_intrinsics
+    mapper_command = [
+        colmap_binary,
+        "mapper",
+        "--database_path",
+        str(database_path),
+        "--image_path",
+        str(image_dir),
+        "--output_path",
+        str(sparse_path),
+        "--Mapper.ba_use_gpu",
+        bool_arg(use_gpu),
+        "--Mapper.ba_gpu_index",
+        gpu_index,
+        "--Mapper.ba_refine_focal_length",
+        bool_arg(refine_intrinsics),
+        "--Mapper.ba_refine_principal_point",
+        bool_arg(refine_intrinsics and refine_principal_point),
+        "--Mapper.ba_refine_extra_params",
+        bool_arg(refine_intrinsics),
+    ]
+
+    return {
+        "feature_extractor": feature_command,
+        matcher.value: matcher_command,
+        "mapper": mapper_command,
+    }
+
+
+def sparse_model_paths(sparse_path: Path) -> list[Path]:
+    if not sparse_path.exists():
+        return []
+
+    def sort_key(path: Path) -> tuple[int, int | str]:
+        try:
+            return (0, int(path.name))
+        except ValueError:
+            return (1, path.name)
+
+    paths = []
+    for path in sorted(sparse_path.iterdir(), key=sort_key):
+        if not path.is_dir():
+            continue
+        if (path / "cameras.bin").exists() or (path / "cameras.txt").exists():
+            paths.append(path)
+    return paths
+
+
+def summarize_sparse_model(model_path: Path) -> dict[str, object]:
+    try:
+        reconstruction = pycolmap.Reconstruction(str(model_path))
+    except Exception as exc:
+        return {
+            "path": str(model_path),
+            "read_error": f"{type(exc).__name__}: {exc}",
+        }
+
+    registered_images = sum(
+        1 for image in reconstruction.images.values() if image.has_pose
+    )
+    mean_reprojection_error = safe_float_method(
+        reconstruction,
+        (
+            "compute_mean_reprojection_error",
+            "mean_reprojection_error",
+        ),
+    )
+    cameras = {
+        str(camera_id): {
+            "model": camera_model_name(camera),
+            "width": camera.width,
+            "height": camera.height,
+            "params": [float(value) for value in np.asarray(camera.params)],
+            "params_info": getattr(camera, "params_info", None),
+        }
+        for camera_id, camera in reconstruction.cameras.items()
+    }
+    return {
+        "path": str(model_path),
+        "summary": reconstruction.summary(),
+        "registered_images": registered_images,
+        "images": len(reconstruction.images),
+        "points3D": len(reconstruction.points3D),
+        "mean_reprojection_error": mean_reprojection_error,
+        "cameras": cameras,
+    }
+
+
+def choose_best_sparse_model(
+    model_summaries: dict[str, dict[str, object]],
+) -> tuple[str | None, dict[str, object] | None]:
+    if not model_summaries:
+        return None, None
+
+    def score(item: tuple[str, dict[str, object]]) -> tuple[int, int]:
+        _, summary = item
+        return (
+            int(summary.get("registered_images") or 0),
+            int(summary.get("points3D") or 0),
+        )
+
+    return max(model_summaries.items(), key=score)
+
+
 def choose_default_threshold(selected_count: int, stride: int) -> float:
     if selected_count >= 250 and stride == 1:
         return 0.75
@@ -1166,6 +1621,280 @@ def register(
         f"({float(summary['registered_pano_ratio']):.1%})."
     )
     if not summary["passed_registration_threshold"]:
+        raise typer.Exit(code=2)
+
+
+@app.command("register-fisheye")
+def register_fisheye(
+    input_path: Path = typer.Option(
+        ...,
+        "--input",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        help="Directory containing raw fisheye image frames.",
+    ),
+    output_path: Path = typer.Option(
+        ...,
+        "--output",
+        file_okay=False,
+        dir_okay=True,
+        help="Run output directory.",
+    ),
+    layout: FisheyeLayout = typer.Option(
+        FisheyeLayout.SINGLE,
+        help="Raw fisheye layout: single stream or dual sensor folders.",
+    ),
+    sensor_folder: list[str] | None = typer.Option(
+        None,
+        "--sensor-folder",
+        help=(
+            "Dual-fisheye sensor folder relative to --input. Repeatable. "
+            "Defaults to fisheye_left and fisheye_right."
+        ),
+    ),
+    camera_model: FisheyeCameraModel = typer.Option(
+        FisheyeCameraModel.OPENCV_FISHEYE,
+        help="COLMAP fisheye camera model.",
+    ),
+    camera_params: str | None = typer.Option(
+        None,
+        help="Optional COLMAP camera params, for example fx,fy,cx,cy,k1,k2,k3,k4.",
+    ),
+    start: int | None = typer.Option(None, help="Minimum numeric image stem to use."),
+    end: int | None = typer.Option(None, help="Maximum numeric image stem to use."),
+    stride: int = typer.Option(1, help="Use every Nth selected raw frame."),
+    matcher: Matcher = typer.Option(Matcher.SEQUENTIAL, help="COLMAP matcher."),
+    loop_detection: bool = typer.Option(
+        True,
+        "--loop-detection/--no-loop-detection",
+        help="Enable loop detection for sequential matching.",
+    ),
+    vocab_tree_path: Path | None = typer.Option(
+        None,
+        help="Vocabulary tree path required by --matcher vocabtree.",
+    ),
+    mask_rect: list[str] | None = typer.Option(
+        None,
+        "--mask-rect",
+        help="Raw-image normalized mask rectangle as x0,y0,x1,y1. Repeatable.",
+    ),
+    lens_circle: str | None = typer.Option(
+        None,
+        help="Keep only a normalized circular lens region as cx,cy,r.",
+    ),
+    preview_count: int = typer.Option(6, help="Number of raw mask previews."),
+    fix_intrinsics: bool = typer.Option(
+        False,
+        "--fix-intrinsics",
+        help="Disable focal length, principal point, and distortion refinement.",
+    ),
+    refine_principal_point: bool = typer.Option(
+        False,
+        "--refine-principal-point",
+        help="Allow mapper bundle adjustment to refine principal point.",
+    ),
+    use_gpu: bool = typer.Option(
+        True,
+        "--use-gpu/--no-use-gpu",
+        help="Use CUDA for SIFT extraction, matching, and mapper BA.",
+    ),
+    gpu_index: str = typer.Option("0", help="COLMAP GPU index."),
+    colmap_binary: str = typer.Option("colmap-cuda", help="COLMAP executable."),
+    copy_images: bool = typer.Option(
+        False,
+        "--copy-images/--symlink-images",
+        help="Copy selected images into the run directory instead of symlinking.",
+    ),
+    min_registered_image_ratio: float = typer.Option(
+        0.75,
+        help="Registration pass threshold for selected raw images.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Prepare files and command logs without running COLMAP.",
+    ),
+    overwrite: bool = typer.Option(
+        True,
+        "--overwrite/--no-overwrite",
+        help="Clean this tool's managed outputs inside the run directory first.",
+    ),
+) -> None:
+    """Run fisheye-aware COLMAP SfM on raw fisheye image frames."""
+    input_path = input_path.expanduser().resolve()
+    output_path = output_path.expanduser().resolve()
+    if layout == FisheyeLayout.DUAL:
+        sensor_folders = tuple(sensor_folder or ("fisheye_left", "fisheye_right"))
+    else:
+        sensor_folders = ()
+    if fix_intrinsics and not camera_params:
+        raise typer.BadParameter("--fix-intrinsics requires --camera-params.")
+    custom_rects = [parse_mask_rect(rect) for rect in (mask_rect or [])]
+    parsed_lens_circle = parse_lens_circle(lens_circle) if lens_circle else None
+
+    selection = collect_fisheye_images(
+        input_path=input_path,
+        layout=layout,
+        sensor_folders=sensor_folders,
+        start=start,
+        end=end,
+        stride=stride,
+    )
+
+    prepare_output_path(output_path, overwrite=overwrite)
+    image_dir = output_path / "images"
+    masks_dir = output_path / "masks"
+    logs_dir = output_path / "logs"
+    previews_dir = output_path / "previews"
+    reports_dir = output_path / "reports"
+    sparse_path = output_path / "sparse"
+    for path in (image_dir, masks_dir, logs_dir, previews_dir, reports_dir, sparse_path):
+        path.mkdir(parents=True, exist_ok=True)
+
+    console.print(
+        f"Selected {len(selection.image_names)} raw fisheye images from {input_path}."
+    )
+    stage_fisheye_images(
+        input_path=input_path,
+        output_image_dir=image_dir,
+        image_names=selection.image_names,
+        copy_images=copy_images,
+    )
+    image_list_path = output_path / "image_list.txt"
+    write_image_list(image_list_path, selection.image_names)
+    mask_count = write_fisheye_masks(
+        image_dir=image_dir,
+        mask_dir=masks_dir,
+        preview_dir=previews_dir,
+        image_names=selection.image_names,
+        mask_rects=custom_rects,
+        lens_circle=parsed_lens_circle,
+        preview_count=preview_count,
+    )
+
+    database_path = output_path / "database.db"
+    commands = build_fisheye_colmap_commands(
+        colmap_binary=colmap_binary,
+        database_path=database_path,
+        image_dir=image_dir,
+        masks_dir=masks_dir,
+        sparse_path=sparse_path,
+        image_list_path=image_list_path,
+        layout=layout,
+        camera_model=camera_model,
+        camera_params=camera_params,
+        mask_count=mask_count,
+        matcher=matcher,
+        loop_detection=loop_detection,
+        vocab_tree_path=vocab_tree_path,
+        use_gpu=use_gpu,
+        gpu_index=gpu_index,
+        fix_intrinsics=fix_intrinsics,
+        refine_principal_point=refine_principal_point,
+    )
+
+    config = {
+        "input_path": str(input_path),
+        "output_path": str(output_path),
+        "layout": layout.value,
+        "sensor_folders": list(sensor_folders),
+        "camera_model": camera_model.value,
+        "camera_params": camera_params,
+        "start": start,
+        "end": end,
+        "stride": stride,
+        "matcher": matcher.value,
+        "loop_detection": loop_detection,
+        "mask_rects": custom_rects,
+        "lens_circle": parsed_lens_circle,
+        "fix_intrinsics": fix_intrinsics,
+        "refine_principal_point": refine_principal_point,
+        "use_gpu": use_gpu,
+        "gpu_index": gpu_index,
+        "colmap_binary": colmap_binary,
+        "copy_images": copy_images,
+    }
+    (output_path / "fisheye_config.json").write_text(
+        json.dumps(config, indent=2),
+        encoding="utf-8",
+    )
+    (output_path / "colmap_commands.json").write_text(
+        json.dumps(
+            {
+                label: {
+                    "argv": command,
+                    "command": command_string(command),
+                }
+                for label, command in commands.items()
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    if dry_run:
+        summary = {
+            **config,
+            "dry_run": True,
+            "selected_image_count": len(selection.image_names),
+            "image_counts_by_sensor": selection.image_counts_by_sensor,
+            "image_sizes_by_sensor": selection.image_sizes_by_sensor,
+            "mask_count": mask_count,
+            "commands_path": str(output_path / "colmap_commands.json"),
+            "output_size_bytes": directory_size(output_path),
+        }
+        summary_path = reports_dir / "registration_summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        console.print(f"Dry run complete. Wrote report: {summary_path}")
+        return
+
+    for label, command in commands.items():
+        run_logged_command(label, command, logs_dir / f"{label}.log")
+
+    model_summaries = {
+        model_path.name: summarize_sparse_model(model_path)
+        for model_path in sparse_model_paths(sparse_path)
+    }
+    best_model_id, best_model = choose_best_sparse_model(model_summaries)
+    registered_images = int(best_model.get("registered_images") or 0) if best_model else 0
+    selected_image_count = len(selection.image_names)
+    registered_image_ratio = (
+        registered_images / selected_image_count if selected_image_count else 0.0
+    )
+    passed = registered_image_ratio >= min_registered_image_ratio
+
+    summary = {
+        **config,
+        "dry_run": False,
+        "selected_image_count": selected_image_count,
+        "image_counts_by_sensor": selection.image_counts_by_sensor,
+        "image_sizes_by_sensor": selection.image_sizes_by_sensor,
+        "mask_count": mask_count,
+        "best_model_id": best_model_id,
+        "model_count": len(model_summaries),
+        "model_summaries": model_summaries,
+        "registered_images": registered_images,
+        "registered_image_ratio": registered_image_ratio,
+        "points3D": int(best_model.get("points3D") or 0) if best_model else 0,
+        "mean_reprojection_error": (
+            best_model.get("mean_reprojection_error") if best_model else None
+        ),
+        "min_registered_image_ratio": min_registered_image_ratio,
+        "passed_registration_threshold": passed,
+        "output_size_bytes": directory_size(output_path),
+    }
+    summary_path = reports_dir / "registration_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    console.print(f"Wrote registration report: {summary_path}")
+    console.print(
+        "Registered "
+        f"{registered_images}/{selected_image_count} raw images "
+        f"({registered_image_ratio:.1%})."
+    )
+    if not passed:
         raise typer.Exit(code=2)
 
 
