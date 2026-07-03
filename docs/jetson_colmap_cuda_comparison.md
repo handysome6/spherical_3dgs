@@ -43,8 +43,8 @@ colmap   3.12.5 cuda_126h106f28d_0
 Important behavior:
 
 - `pycolmap.has_cuda == True`
-- SIFT feature extraction uses CUDA.
-- SIFT matching uses CUDA.
+- SIFT feature extraction used CUDA.
+- SIFT matching used CUDA.
 - Bundle adjustment was kept on CPU because the first BA-GPU attempt hit the
   conda-forge Ceres limitation:
 
@@ -52,6 +52,10 @@ Important behavior:
 Can't use DENSE_SCHUR with dense_linear_algebra_library_type = CUDA because
 support not enabled when Ceres was built.
 ```
+
+So the conda-forge/Pixi run should not be interpreted as a CPU-only COLMAP
+baseline. It was GPU accelerated for feature calculation and matching. Its
+major limitation was mapping/BA, where it had to fall back to CPU.
 
 Other limitations:
 
@@ -158,24 +162,24 @@ Pipeline:
 1. Select 304 equirectangular panoramas.
 2. Render 3648 virtual perspective images.
 3. Render/project masks.
-4. Extract SIFT features with PyCOLMAP.
+4. Extract SIFT features with PyCOLMAP using CUDA.
 5. Apply rig configuration.
-6. Run sequential matching with loop detection.
-7. Run incremental mapping.
+6. Run sequential matching with loop detection using CUDA SIFT matching.
+7. Run incremental mapping with CPU bundle adjustment.
 8. Write `sparse/0`.
 9. Skip `sparse_equirectangular/0` because PyCOLMAP 3.12 lacks
    `CameraModelId.EQUIRECTANGULAR`.
 
 Recorded timing from `runs/logs/jetson_sphere_images_full.log`:
 
-| Stage | Time |
-| --- | ---: |
-| Rendering virtual views | about `22.8 min` |
-| Feature extraction | `7.269 min` |
-| Sequential matching | `45.825 min` |
-| Rig/database overhead | `0.049 min` |
-| Incremental mapping | `228.450 min` |
-| Full pipeline wall time | `18278 s` / `304.6 min` |
+| Stage | Acceleration | Time |
+| --- | --- | ---: |
+| Rendering virtual views | CPU/OpenCV | about `22.8 min` |
+| Feature extraction | CUDA SIFT | `7.269 min` |
+| Sequential matching | CUDA SIFT matching | `45.825 min` |
+| Rig/database overhead | CPU | `0.049 min` |
+| Incremental mapping / BA | CPU BA | `228.450 min` |
+| Full pipeline wall time | mixed | `18278 s` / `304.6 min` |
 
 Model analysis:
 
@@ -298,10 +302,15 @@ Direct COLMAP-stage comparison:
 
 | Stage | Conda/PyCOLMAP 3.12.1 | Self-Built COLMAP 4.1 | Speedup |
 | --- | ---: | ---: | ---: |
-| Feature extraction | `7.269 min` | `7.484 min` | `0.97x` |
-| Matching | `45.825 min` | `37.5 min` | `1.22x` |
-| Mapping / BA | `228.450 min` | `59.158 min` | `3.86x` |
+| Feature extraction | `7.269 min` GPU | `7.484 min` GPU | `0.97x` |
+| Matching | `45.825 min` GPU | `37.5 min` GPU | `1.22x` |
+| Mapping / BA | `228.450 min` CPU BA | `59.158 min` GPU-enabled BA | `3.86x` |
 | COLMAP stages total | `281.6 min` | `104.4 min` | `2.70x` |
+
+The first two rows are not a GPU-versus-CPU comparison. Both backends used GPU
+acceleration for SIFT extraction and matching. The decisive difference is the
+mapping/BA row: conda-forge PyCOLMAP 3.12 had to run BA on CPU, while the
+self-built COLMAP 4.1 package could use the CUDA/Ceres/cuDSS build.
 
 If the reused rendering time from the first run is added back to the self-built
 COLMAP path, the estimated end-to-end time is:
